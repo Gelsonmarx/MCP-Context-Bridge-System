@@ -1,8 +1,9 @@
 import fs from 'fs/promises';
 import path from 'path';
-import { fileExists, readFile, writeFile, appendFile } from './utils.js';
+import { fileExists, readFile as originalReadFile, writeFile as originalWriteFile, appendFile as originalAppendFile } from './utils.js';
+import { SmartCache } from './smart-cache.js';
 
-// Defines the structure for the in-memory project context.
+// Define a estrutura para o contexto do projeto em memória.
 interface ProjectContext {
   dna: string;
   state: string;
@@ -10,32 +11,40 @@ interface ProjectContext {
 }
 
 /**
- * Manages the project context, including loading, updating, and caching.
- * Follows a "lazy loading" and "cache-first" strategy for performance.
+ * Gerencia o contexto do projeto, incluindo carregamento, atualização e cache.
+ * Usa um SmartCache para cache granular de conteúdo de arquivo, focado em performance.
  */
 export class ContextManager {
-  private cache: Map<string, ProjectContext> = new Map();
+  // Utiliza o SmartCache para armazenar o conteúdo dos arquivos com TTL e política de remoção LRU.
+  private fileCache = new SmartCache<string>(50, 10 * 60 * 1000); // Cache para 50 arquivos, com 10 min de TTL
   private readonly projectRoot = process.cwd();
   private readonly contextDir = path.join(this.projectRoot, '.context');
 
   /**
-   * Loads the project context, optionally filtering by a focus area.
-   * Uses a cache to avoid redundant file reads.
+   * Carrega o contexto do projeto, opcionalmente filtrando por uma área de foco.
+   * Usa um cache para evitar leituras de arquivo redundantes.
    */
   async loadContext(focus?: string): Promise<{ content: { type: 'text'; text: string }[] }> {
     try {
-      const context = await this.getContextWithCache();
+      // Carrega os componentes do contexto de forma granular, aproveitando o cache de arquivos.
+      const [dna, state, patterns] = await Promise.all([
+        this._readFile(path.join(this.contextDir, 'PROJECT_DNA.md')),
+        this._readFile(path.join(this.contextDir, 'CURRENT_STATE.md')),
+        this.readAllPatterns()
+      ]);
+
+      const context: ProjectContext = { dna, state, patterns };
       
-      // Filter patterns based on the focus keyword, or take the most relevant if no focus is provided.
+      // Filtra os padrões com base na palavra-chave de foco ou pega os mais relevantes se nenhum foco for fornecido.
       const relevantPatterns = focus 
         ? context.patterns.filter(p => p.toLowerCase().includes(focus.toLowerCase()))
-        : context.patterns.slice(0, 3); // Default to the 3 most relevant patterns.
+        : context.patterns.slice(0, 3); // Padrão para os 3 padrões mais relevantes (agora ordenados por data de modificação).
       
       const contextText = this.formatContextForDisplay(context, relevantPatterns, focus);
       
       return { content: [{ type: 'text', text: contextText }] };
     } catch (error) {
-      // Guide the user to initialize the context if it's not found.
+      // Guia o usuário para inicializar o contexto se ele não for encontrado.
       return {
         content: [{ 
           type: 'text', 
@@ -46,8 +55,8 @@ export class ContextManager {
   }
   
   /**
-   * Updates the context files based on the latest development session.
-   * This operation is atomic and clears the cache to ensure fresh data on next load.
+   * Atualiza os arquivos de contexto com base na última sessão de desenvolvimento.
+   * Esta operação é atômica e invalida o cache para os arquivos atualizados.
    */
   async updateContext(args: any): Promise<{ content: { type: 'text'; text: string }[] }> {
     const timestamp = new Date().toISOString();
@@ -55,15 +64,13 @@ export class ContextManager {
     try {
       await this.ensureContextStructure();
       
-      // Atomically update all relevant context files
+      // Atualiza atomicamente todos os arquivos de contexto relevantes.
       await Promise.all([
         this.updateCurrentStateFile(args, timestamp),
         this.updateActiveContextFile(args, timestamp),
         this.logSessionToFile(args, timestamp)
       ]);
-      
-      this.cache.clear(); // Invalidate cache after update
-      
+            
       return {
         content: [{ 
           type: 'text', 
@@ -79,28 +86,8 @@ export class ContextManager {
   }
 
   /**
-   * Retrieves the project context from cache or file system.
-   */
-  private async getContextWithCache(): Promise<ProjectContext> {
-    const cacheKey = 'full_project_context';
-    if (this.cache.has(cacheKey)) {
-      return this.cache.get(cacheKey)!;
-    }
-    
-    const [dna, state, patterns] = await Promise.all([
-      readFile(path.join(this.contextDir, 'PROJECT_DNA.md')),
-      readFile(path.join(this.contextDir, 'CURRENT_STATE.md')), 
-      this.readAllPatterns()
-    ]);
-    
-    const context: ProjectContext = { dna, state, patterns };
-    this.cache.set(cacheKey, context);
-    
-    return context;
-  }
-
-  /**
-   * Reads all pattern files from the '.context/patterns' directory.
+   * Lê todos os arquivos de padrão do diretório '.context/patterns',
+   * ordenados pelos mais recentemente modificados.
    */
   private async readAllPatterns(): Promise<string[]> {
     const patternsDir = path.join(this.contextDir, 'patterns');
@@ -108,20 +95,33 @@ export class ContextManager {
       return [];
     }
 
-    const files = await fs.readdir(patternsDir);
-    const patternPromises = files
-      .filter(f => f.endsWith('.md'))
-      .map(async (file) => {
-        const content = await readFile(path.join(patternsDir, file));
-        // Format pattern with its title derived from the filename.
-        return `### ${file.replace('.md', '').replace(/_/g, ' ')}\n${content}`;
+    const allFiles = await fs.readdir(patternsDir);
+    const mdFiles = allFiles.filter(f => f.endsWith('.md'));
+
+    // Obtém detalhes e data de modificação para cada arquivo.
+    const fileDetails = await Promise.all(
+      mdFiles.map(async file => {
+        const filePath = path.join(patternsDir, file);
+        const stats = await fs.stat(filePath);
+        return { file, filePath, mtime: stats.mtime };
+      })
+    );
+
+    // Ordena os arquivos pela data de modificação (mais recente primeiro).
+    fileDetails.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+
+    // Lê o conteúdo dos arquivos já ordenados.
+    const patternPromises = fileDetails.map(async (detail) => {
+        const content = await this._readFile(detail.filePath); // Usa o leitor com cache.
+        // Formata o padrão com seu título derivado do nome do arquivo.
+        return `### ${detail.file.replace('.md', '').replace(/_/g, ' ')}\n${content}`;
       });
       
     return Promise.all(patternPromises);
   }
   
   /**
-   * Formats the context into a single markdown string for the AI model.
+   * Formata o contexto em uma única string de markdown para o modelo de IA.
    */
   private formatContextForDisplay(context: ProjectContext, patterns: string[], focus?: string): string {
     return `# 🧠 PROJECT CONTEXT ${focus ? `- FOCUS: ${focus.toUpperCase()}` : ''}
@@ -140,7 +140,7 @@ ${patterns.length > 0 ? `## 🧩 ACTIVE PATTERNS\n${patterns.join('\n\n')}` : ''
   }
   
   /**
-   * Updates the CURRENT_STATE.md file.
+   * Atualiza o arquivo CURRENT_STATE.md.
    */
   private async updateCurrentStateFile(args: any, timestamp: string): Promise<void> {
     const content = `# CURRENT STATE
@@ -158,11 +158,11 @@ ${args.next?.length ? args.next.map((t: string) => `- 🎯 ${t}`).join('\n') : '
 ### Recent Decisions
 ${args.decisions?.length ? args.decisions.map((d: string) => `- 📝 ${d}`).join('\n') : 'N/A'}
 `;
-    await writeFile(path.join(this.contextDir, 'CURRENT_STATE.md'), content);
+    await this._writeFile(path.join(this.contextDir, 'CURRENT_STATE.md'), content);
   }
   
   /**
-   * Updates the ACTIVE_CONTEXT.md file for quick reference.
+   * Atualiza o arquivo ACTIVE_CONTEXT.md para referência rápida.
    */
   private async updateActiveContextFile(args: any, timestamp: string): Promise<void> {
     const content = `# ACTIVE CONTEXT (For Quick Reference)
@@ -174,11 +174,11 @@ ${args.next?.[0] || 'Define the next immediate task.'}
 ## Summary
 ${args.summary}
 `;
-    await writeFile(path.join(this.contextDir, 'ACTIVE_CONTEXT.md'), content);
+    await this._writeFile(path.join(this.contextDir, 'ACTIVE_CONTEXT.md'), content);
   }
 
   /**
-   * Appends a summary of the session to the SESSION_LOG.md file.
+   * Anexa um resumo da sessão ao arquivo SESSION_LOG.md.
    */
   private async logSessionToFile(args: any, timestamp: string): Promise<void> {
     const logEntry = `
@@ -188,24 +188,24 @@ ${args.summary}
 **Completed:** ${args.completed?.join(', ') || 'N/A'}
 **Decisions:** ${args.decisions?.join(', ') || 'N/A'}
 `;
-    await appendFile(path.join(this.contextDir, 'SESSION_LOG.md'), logEntry);
+    await this._appendFile(path.join(this.contextDir, 'SESSION_LOG.md'), logEntry);
   }
   
   /**
-   * Ensures the necessary .context directory structure exists.
-   * Creates a default PROJECT_DNA.md if it's missing.
+   * Garante que a estrutura de diretórios .context necessária exista.
+   * Cria um PROJECT_DNA.md padrão se estiver ausente.
    */
   private async ensureContextStructure(): Promise<void> {
     await fs.mkdir(path.join(this.contextDir, 'patterns'), { recursive: true });
 
     const dnaPath = path.join(this.contextDir, 'PROJECT_DNA.md');
     if (!await fileExists(dnaPath)) {
-      await writeFile(dnaPath, this.getDefaultProjectDNA());
+      await this._writeFile(dnaPath, this.getDefaultProjectDNA());
     }
   }
   
   /**
-   * Provides a default template for the PROJECT_DNA.md file.
+   * Fornece um template padrão para o arquivo PROJECT_DNA.md.
    */
   private getDefaultProjectDNA(): string {
     return `# 🧬 PROJECT DNA
@@ -230,5 +230,37 @@ ${args.summary}
 - **Code Style:** [e.g., Prettier, ESLint with a specific config]
 - **API Design:** [e.g., RESTful, GraphQL]
 `;
+  }
+
+  // --- Métodos de I/O com Cache ---
+
+  /**
+   * Lê um arquivo usando uma estratégia "cache-first".
+   */
+  private async _readFile(filePath: string): Promise<string> {
+    const cachedContent = this.fileCache.get(filePath);
+    if (cachedContent !== null) {
+      return cachedContent;
+    }
+
+    const fileContent = await originalReadFile(filePath);
+    this.fileCache.set(filePath, fileContent);
+    return fileContent;
+  }
+
+  /**
+   * Escreve em um arquivo e invalida sua entrada no cache.
+   */
+  private async _writeFile(filePath: string, content: string): Promise<void> {
+    await originalWriteFile(filePath, content);
+    this.fileCache.invalidatePattern(new RegExp(`^${filePath}$`)); // Invalida a chave exata
+  }
+
+  /**
+   * Anexa a um arquivo e invalida sua entrada no cache.
+   */
+  private async _appendFile(filePath: string, content: string): Promise<void> {
+    await originalAppendFile(filePath, content);
+    this.fileCache.invalidatePattern(new RegExp(`^${filePath}$`)); // Invalida a chave exata
   }
 }

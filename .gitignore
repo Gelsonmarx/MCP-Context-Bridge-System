@@ -1,0 +1,33 @@
+# Ignore dependencies
+# These packages are installed via `npm install`
+node_modules/
+
+# Ignore build output
+# This directory contains the compiled JavaScript code
+dist/
+
+# Ignore log files
+# These are generated for debugging and are not part of the source code
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Ignore environment variables file
+# This file may contain sensitive information like API keys
+.env
+.env.local
+.env.*.local
+
+# Ignore OS-generated files
+.DS_Store
+Thumbs.db
+
+# Ignore IDE/Editor configuration files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
